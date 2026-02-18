@@ -1,18 +1,60 @@
 import * as fs from 'fs'
 import * as path from 'path'
+import * as os from 'os'
 import { InvoiceConfigs, InvoiceConfig } from './types/config'
 
-const CONFIG_FILE = path.join(__dirname, '../invoice-configs.json')
+const HOME_CONFIG_DIR = path.join(os.homedir(), '.invoice-generator')
+const HOME_CONFIG_FILE = path.join(HOME_CONFIG_DIR, 'config.json')
+const BASE_CONFIG_FILE = path.join(__dirname, '../invoice-configs.json')
+
+/**
+ * Get the path to the user's config file
+ */
+export function getUserConfigPath(): string {
+  return HOME_CONFIG_FILE
+}
+
+/**
+ * Determine which config file to load.
+ * Prefers ~/.invoice-generator/config.json, falls back to repo template.
+ */
+function getConfigPath(): string {
+  if (fs.existsSync(HOME_CONFIG_FILE)) {
+    return HOME_CONFIG_FILE
+  }
+  return BASE_CONFIG_FILE
+}
+
+/**
+ * Ensure the user config exists at ~/.invoice-generator/config.json.
+ * If it doesn't exist, copies the base template from the repo.
+ */
+export function ensureUserConfig(): string {
+  if (!fs.existsSync(HOME_CONFIG_DIR)) {
+    fs.mkdirSync(HOME_CONFIG_DIR, { recursive: true })
+  }
+
+  if (!fs.existsSync(HOME_CONFIG_FILE)) {
+    if (!fs.existsSync(BASE_CONFIG_FILE)) {
+      throw new Error(`Base config template not found: ${BASE_CONFIG_FILE}`)
+    }
+    fs.copyFileSync(BASE_CONFIG_FILE, HOME_CONFIG_FILE)
+  }
+
+  return HOME_CONFIG_FILE
+}
 
 /**
  * Load the invoice configurations from file
  */
 export function loadConfigs(): InvoiceConfigs {
-  if (!fs.existsSync(CONFIG_FILE)) {
-    throw new Error(`Config file not found: ${CONFIG_FILE}`)
+  const configFile = getConfigPath()
+
+  if (!fs.existsSync(configFile)) {
+    throw new Error(`Config file not found: ${configFile}`)
   }
 
-  const configData = fs.readFileSync(CONFIG_FILE, 'utf-8')
+  const configData = fs.readFileSync(configFile, 'utf-8')
   const configs: InvoiceConfigs = JSON.parse(configData)
 
   // Validate version

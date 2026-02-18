@@ -1,39 +1,30 @@
 {
   "version": "1.0.0",
   "global": {
-    "defaultFromEmail": "b@stokedconsulting.com",
-    "defaultBcc": ["b@stokedconsulting.com"]
+    "defaultFromEmail": "you@example.com",
+    "defaultBcc": []
   },
   "invoices": [
     {
-      "id": "xferall-biweekly",
-      "name": "Xferall Bi-Weekly Invoice",
-      "customer": "Xferall",
-      "enabled": true,
+      "id": "example-biweekly",
+      "name": "Example Bi-Weekly Invoice",
+      "customer": "Acme Corp",
+      "enabled": false,
       "schedule": {
         "type": "bi-weekly-sunday",
-        "startDate": "2024-09-15"
+        "startDate": "2024-01-07"
       },
       "email": {
-        "to": [
-          "brianstoker+tony@gmail.com",
-          "brianstoker+chris@gmail.com"
-        ],
-        "cc": [
-          "brianstoker@gmail.com"
-        ],
-        "subject": "Stoked Consulting Invoice for {{customer}} from {{startDate}} - {{endDate}}",
-        "fromName": "Brian Stoker"
+        "to": ["billing@example.com"],
+        "cc": [],
+        "subject": "Invoice for {{customer}} from {{startDate}} - {{endDate}}",
+        "fromName": "Your Name"
       },
       "git": {
-        "repos": [
-          "xferall/xferinpatient"
-        ],
-        "repoDirs": [
-          "/opt/dev/xferall*"
-        ],
+        "repos": ["org/repo-name"],
+        "repoDirs": ["/path/to/local/repos*"],
         "weeks": 2,
-        "hoursPerWeek": 30
+        "hoursPerWeek": 40
       },
       "ai": {
         "enabled": true,

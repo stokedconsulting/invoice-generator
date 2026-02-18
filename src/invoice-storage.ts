@@ -1,5 +1,6 @@
 import * as fs from 'fs'
 import * as path from 'path'
+import * as os from 'os'
 import { InvoiceData } from './invoice-generator'
 
 export interface SavedInvoice {
@@ -10,7 +11,8 @@ export interface SavedInvoice {
   invoiceData: InvoiceData
 }
 
-const INVOICES_DIR = path.join(process.cwd(), '.invoices')
+// Use ~/.invoice-generator/.invoices/ for consistent storage across all environments
+const INVOICES_DIR = path.join(os.homedir(), '.invoice-generator', '.invoices')
 
 /**
  * Ensure the invoices directory exists

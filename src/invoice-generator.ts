@@ -7,12 +7,14 @@ import { promisify } from 'util'
 import { InvoiceConfig } from './types/config'
 import { glob } from 'glob'
 import { runAIAnalysis } from './ai-analyzer'
+import { selectLineItems, showSelectionSummary, LineItemCandidate } from './interactive-selector'
 
 const execAsync = promisify(exec)
 
 interface InvoiceOptions {
   customer: string
   weeks?: number
+  scope?: number
   startDate?: string
   endDate?: string
   verbose?: boolean
@@ -23,6 +25,10 @@ interface InvoiceOptions {
 
 interface InvoiceOptionsFromConfig {
   config: InvoiceConfig
+  runtimeContext?: string
+  weeksOverride?: number
+  scopeOverride?: number
+  interactive?: boolean
   verbose?: boolean
 }
 
@@ -49,10 +55,13 @@ export interface InvoiceData {
   weeks: WeeklyWork[]
 }
 
-export async function generateInvoice(options: InvoiceOptions, config?: InvoiceConfig): Promise<InvoiceData | null> {
-  const { customer, weeks = 2, verbose, repoPaths, githubRepos, hoursPerWeek = 30 } = options
+export async function generateInvoice(options: InvoiceOptions, config?: InvoiceConfig, runtimeContext?: string, interactive?: boolean): Promise<InvoiceData | null> {
+  const { customer, weeks = 2, scope, verbose, repoPaths, githubRepos, hoursPerWeek = 30 } = options
 
-  // Calculate date range
+  // scope determines commit collection window, weeks determines invoice period
+  const commitScope = scope || weeks
+
+  // Calculate invoice date range (based on weeks)
   let endDate: Date
   let startDate: Date
 
@@ -66,36 +75,43 @@ export async function generateInvoice(options: InvoiceOptions, config?: InvoiceC
   if (options.startDate) {
     startDate = parseISO(options.startDate)
   } else {
-    // Start of N weeks ago
+    // Start of N weeks ago (invoice period)
     startDate = startOfWeek(subWeeks(endDate, weeks - 1), { weekStartsOn: 0 })
   }
 
+  // Calculate commit collection date range (based on scope)
+  const commitCollectionStart = startOfWeek(subWeeks(endDate, commitScope - 1), { weekStartsOn: 0 })
+
   if (verbose) {
-    console.log(`Analyzing commits from ${format(startDate, 'yyyy-MM-dd')} to ${format(endDate, 'yyyy-MM-dd')}`)
+    console.log(`Analyzing commits from ${format(commitCollectionStart, 'yyyy-MM-dd')} to ${format(endDate, 'yyyy-MM-dd')}`)
+    if (commitScope > weeks) {
+      console.log(`  Invoice period: ${format(startDate, 'yyyy-MM-dd')} to ${format(endDate, 'yyyy-MM-dd')} (${weeks} weeks)`)
+      console.log(`  Commit scope: ${commitScope} weeks (${commitScope - weeks} extra week(s) for more line item options)`)
+    }
   }
 
-  // Analyze commits for each week
+  // Collect ALL commits from the scope period (commitCollectionStart to endDate)
+  const allCommits = await collectCommitsForPeriod(
+    commitCollectionStart,
+    endDate,
+    { githubRepos, repoPaths, customer, verbose }
+  )
+
+  // Build weekly work structure for invoice period (startDate to endDate)
   const weeklyWork: WeeklyWork[] = []
-  const allCommits: Array<{ message: string; date: Date; repo: string }> = []
   let currentWeekStart = startDate
 
   while (currentWeekStart <= endDate) {
     const currentWeekEnd = endOfWeek(currentWeekStart, { weekStartsOn: 0 })
 
-    const { weekWork, commits } = await analyzeWeekWithCommits(
-      currentWeekStart,
-      currentWeekEnd,
-      hoursPerWeek,
-      {
-        githubRepos,
-        repoPaths,
-        customer,
-        verbose
-      }
-    )
+    weeklyWork.push({
+      weekStart: currentWeekStart,
+      weekEnd: currentWeekEnd,
+      dateRange: `${format(currentWeekStart, 'MMMM d')} - ${format(currentWeekEnd, 'MMMM d, yyyy')}`,
+      totalHours: hoursPerWeek,
+      tasks: []
+    })
 
-    weeklyWork.push(weekWork)
-    allCommits.push(...commits)
     currentWeekStart = addWeeks(currentWeekStart, 1)
   }
 
@@ -104,21 +120,51 @@ export async function generateInvoice(options: InvoiceOptions, config?: InvoiceC
   // Run AI analysis if enabled
   if (config?.ai?.enabled && allCommits.length > 0) {
     try {
-      const aiResult = await runAIAnalysis(allCommits, totalHours, config, verbose)
+      // Run AI analysis separately for each week to get week-specific line items
+      const weeklySelections = new Map<string, LineItemCandidate[]>()
 
-      // If we have AI-generated line items, use them instead of categorization
-      if (aiResult.lineItems) {
-        // Parse AI-generated line items and redistribute across weeks
-        const aiTasks = parseAILineItems(aiResult.lineItems)
+      for (let i = 0; i < weeklyWork.length; i++) {
+        const week = weeklyWork[i]
 
-        // Redistribute tasks across weeks proportionally
-        weeklyWork.forEach((week, index) => {
-          const weekProportion = week.totalHours / totalHours
-          week.tasks = aiTasks.map(task => ({
-            ...task,
-            hours: Math.round(task.hours * weekProportion * 2) / 2 // Round to nearest 0.5
-          })).filter(task => task.hours > 0)
-        })
+        // Get commits for this specific week
+        const weekCommits = allCommits.filter(commit =>
+          commit.date >= week.weekStart && commit.date <= week.weekEnd
+        )
+
+        if (weekCommits.length > 0) {
+          const aiResult = await runAIAnalysis(weekCommits, week.totalHours, config, runtimeContext, interactive, verbose)
+
+          // If we have AI-generated line items
+          if (aiResult.lineItems) {
+            const aiTasks = parseAILineItems(aiResult.lineItems)
+
+            // Interactive mode: let user choose
+            if (interactive && aiTasks.length > 0) {
+              const candidates: LineItemCandidate[] = aiTasks.map(task => ({
+                description: task.description,
+                hours: task.hours,
+                selected: false
+              }))
+
+              const selected = await selectLineItems(candidates, week.totalHours, week.dateRange)
+              weeklySelections.set(week.dateRange, selected)
+
+              week.tasks = selected.map(item => ({
+                description: item.description,
+                hours: item.hours,
+                commits: 0
+              }))
+            } else {
+              // Non-interactive mode: use all items
+              week.tasks = aiTasks.filter(task => task.hours > 0)
+            }
+          }
+        }
+      }
+
+      // Show summary of selections in interactive mode
+      if (interactive && weeklySelections.size > 0) {
+        showSelectionSummary(weeklySelections)
       }
     } catch (error) {
       if (verbose) {
@@ -142,19 +188,26 @@ export async function generateInvoice(options: InvoiceOptions, config?: InvoiceC
 }
 
 export async function generateInvoiceFromConfig(options: InvoiceOptionsFromConfig): Promise<InvoiceData | null> {
-  const { config, verbose } = options
+  const { config, runtimeContext, weeksOverride, scopeOverride, interactive, verbose } = options
 
   // Use repoDirs (local directories) if provided, otherwise empty
   const repoPaths = config.git.repoDirs || []
 
+  // Use weeks override if provided, otherwise use config default
+  const weeks = weeksOverride || config.git.weeks
+
+  // Use scope override if provided, otherwise use weeks (default behavior)
+  const scope = scopeOverride || weeks
+
   return generateInvoice({
     customer: config.customer,
-    weeks: config.git.weeks,
+    weeks,
+    scope,
     repoPaths,
     hoursPerWeek: config.git.hoursPerWeek,
     verbose,
     githubRepos: config.git.repos
-  }, config)
+  }, config, runtimeContext, interactive)
 }
 
 async function resolveRepoPaths(patterns: string[], verbose?: boolean): Promise<string[]> {
@@ -169,10 +222,11 @@ async function resolveRepoPaths(patterns: string[], verbose?: boolean): Promise<
         const stat = await fs.promises.stat(match)
 
         if (stat.isDirectory()) {
-          // Check if it's a git repository
-          const gitPath = path.join(match, '.git')
+          // Check if it's a valid git repository (including worktrees)
+          const git: SimpleGit = simpleGit(match)
           try {
-            await fs.promises.access(gitPath)
+            // Try to check if it's a valid git repo
+            await git.revparse(['--git-dir'])
             dirs.push(match)
           } catch {
             if (verbose) {
@@ -240,16 +294,16 @@ async function analyzeWeek(
   return result.weekWork
 }
 
-async function analyzeWeekWithCommits(
-  weekStart: Date,
-  weekEnd: Date,
-  hoursPerWeek: number,
-  options: AnalyzeWeekOptions
-): Promise<{ weekWork: WeeklyWork; commits: Array<{ message: string; date: Date; repo: string }> }> {
+async function collectCommitsForPeriod(
+  periodStart: Date,
+  periodEnd: Date,
+  options: { githubRepos?: string[]; repoPaths?: string[]; customer: string; verbose?: boolean }
+): Promise<Array<{ message: string; date: Date; repo: string }>> {
   const { githubRepos, repoPaths, customer, verbose } = options
-  const allCommits: Array<{ message: string; date: Date; repo: string }> = []
+  const githubCommits: Array<{ message: string; date: Date; repo: string; hash: string }> = []
+  const localCommits: Array<{ message: string; date: Date; repo: string; hash: string }> = []
 
-  // Primary: Try to get commits from GitHub repos
+  // Step 1: Collect commits from GitHub repos
   if (githubRepos && githubRepos.length > 0) {
     if (verbose) {
       console.log(`Fetching commits from GitHub repos: ${githubRepos.join(', ')}`)
@@ -257,10 +311,10 @@ async function analyzeWeekWithCommits(
 
     for (const repo of githubRepos) {
       try {
-        const commits = await getGitHubCommitsForRepo(repo, weekStart, weekEnd, verbose)
-        allCommits.push(...commits)
+        const commits = await getGitHubCommitsForRepo(repo, periodStart, periodEnd, verbose)
+        githubCommits.push(...commits)
         if (verbose) {
-          console.log(`  Found ${commits.length} commits in ${repo}`)
+          console.log(`  Found ${commits.length} GitHub commits in ${repo}`)
         }
       } catch (error) {
         if (verbose) {
@@ -270,58 +324,191 @@ async function analyzeWeekWithCommits(
     }
   }
 
-  // Fallback: If no GitHub commits found, try local directories
-  if (allCommits.length === 0) {
-    if (verbose) {
-      console.log('No GitHub commits found, falling back to local repositories...')
-    }
+  // Step 2: ALWAYS collect commits from local directories
+  let projectDirs: string[] = []
 
-    let projectDirs: string[] = []
+  if (repoPaths && repoPaths.length > 0) {
+    projectDirs = await resolveRepoPaths(repoPaths, verbose)
+  } else if (customer) {
+    projectDirs = await getProjectDirectories(customer)
+  }
 
-    // Try repoPaths first
-    if (repoPaths && repoPaths.length > 0) {
-      projectDirs = await resolveRepoPaths(repoPaths, verbose)
-    }
-    // If still no dirs and we have a customer, try customer-based search
-    else if (customer) {
-      projectDirs = await getProjectDirectories(customer)
-    }
+  if (verbose && projectDirs.length > 0) {
+    console.log(`Fetching commits from ${projectDirs.length} local directories:`)
+    projectDirs.forEach(dir => console.log(`  - ${dir}`))
+  }
 
-    if (verbose && projectDirs.length > 0) {
-      console.log(`Found ${projectDirs.length} local directories:`)
-      projectDirs.forEach(dir => console.log(`  - ${dir}`))
-    }
+  for (const dir of projectDirs) {
+    const git: SimpleGit = simpleGit(dir)
 
-    for (const dir of projectDirs) {
-      const git: SimpleGit = simpleGit(dir)
+    try {
+      const log = await git.log({
+        '--all': null,
+        '--since': format(periodStart, 'yyyy-MM-dd'),
+        '--until': format(periodEnd, 'yyyy-MM-dd 23:59:59')
+      })
 
-      try {
-        const log = await git.log({
-          from: format(weekStart, 'yyyy-MM-dd'),
-          to: format(weekEnd, 'yyyy-MM-dd'),
-          '--all': null
+      const repoName = path.basename(dir)
+
+      for (const commit of log.all) {
+        localCommits.push({
+          message: commit.message,
+          date: new Date(commit.date),
+          repo: repoName,
+          hash: commit.hash
         })
+      }
 
-        const repoName = path.basename(dir)
-
-        for (const commit of log.all) {
-          allCommits.push({
-            message: commit.message,
-            date: new Date(commit.date),
-            repo: repoName
-          })
+      if (verbose) {
+        console.log(`  Found ${log.all.length} local commits in ${repoName}`)
+      }
+    } catch (error: any) {
+      if (verbose) {
+        let errorMsg = error?.message || String(error)
+        if (errorMsg.includes('dubious ownership')) {
+          errorMsg = 'dubious ownership (run: git config --global --add safe.directory ' + dir + ')'
+        } else if (errorMsg.includes('not a git repository')) {
+          errorMsg = 'not a valid git repository or worktree'
         }
+        console.log(`  Skipping ${path.basename(dir)}: ${errorMsg}`)
+      }
+    }
+  }
 
+  // Step 3: Deduplicate by hash
+  const githubHashes = new Set(githubCommits.map(c => c.hash))
+  const localOnlyCommits = localCommits.filter(c => !githubHashes.has(c.hash))
+  const commonCommits = localCommits.filter(c => githubHashes.has(c.hash))
+
+  if (verbose) {
+    console.log(`\n📊 Commit breakdown:`)
+    console.log(`  Local-only (unpushed): ${localOnlyCommits.length}`)
+    console.log(`  Pushed to GitHub: ${commonCommits.length}`)
+    console.log(`  Total unique: ${localOnlyCommits.length + commonCommits.length}`)
+  }
+
+  // Step 4: Combine all commits and sort by date (most recent first)
+  const allCommits = [...localOnlyCommits, ...commonCommits].map(c => ({
+    message: c.message,
+    date: c.date,
+    repo: c.repo
+  }))
+
+  // Sort by date - most recent first (highest priority)
+  allCommits.sort((a, b) => b.date.getTime() - a.date.getTime())
+
+  if (verbose) {
+    console.log(`Total commits found: ${allCommits.length}`)
+  }
+
+  return allCommits
+}
+
+async function analyzeWeekWithCommits(
+  weekStart: Date,
+  weekEnd: Date,
+  hoursPerWeek: number,
+  options: AnalyzeWeekOptions
+): Promise<{ weekWork: WeeklyWork; commits: Array<{ message: string; date: Date; repo: string }> }> {
+  const { githubRepos, repoPaths, customer, verbose } = options
+  const githubCommits: Array<{ message: string; date: Date; repo: string; hash: string }> = []
+  const localCommits: Array<{ message: string; date: Date; repo: string; hash: string }> = []
+
+  // Step 1: Collect commits from GitHub repos
+  if (githubRepos && githubRepos.length > 0) {
+    if (verbose) {
+      console.log(`Fetching commits from GitHub repos: ${githubRepos.join(', ')}`)
+    }
+
+    for (const repo of githubRepos) {
+      try {
+        const commits = await getGitHubCommitsForRepo(repo, weekStart, weekEnd, verbose)
+        githubCommits.push(...commits)
         if (verbose) {
-          console.log(`  Found ${log.all.length} commits in ${repoName}`)
+          console.log(`  Found ${commits.length} GitHub commits in ${repo}`)
         }
       } catch (error) {
         if (verbose) {
-          console.log(`  Could not read git log from ${dir}:`, error)
+          console.log(`  Could not fetch GitHub commits from ${repo}:`, error)
         }
       }
     }
   }
+
+  // Step 2: ALWAYS collect commits from local directories (not a fallback)
+  let projectDirs: string[] = []
+
+  // Try repoPaths first
+  if (repoPaths && repoPaths.length > 0) {
+    projectDirs = await resolveRepoPaths(repoPaths, verbose)
+  }
+  // If still no dirs and we have a customer, try customer-based search
+  else if (customer) {
+    projectDirs = await getProjectDirectories(customer)
+  }
+
+  if (verbose && projectDirs.length > 0) {
+    console.log(`Fetching commits from ${projectDirs.length} local directories:`)
+    projectDirs.forEach(dir => console.log(`  - ${dir}`))
+  }
+
+  for (const dir of projectDirs) {
+    const git: SimpleGit = simpleGit(dir)
+
+    try {
+      // Use --since and --until instead of from/to to avoid ambiguous revision errors
+      const log = await git.log({
+        '--all': null,
+        '--since': format(weekStart, 'yyyy-MM-dd'),
+        '--until': format(weekEnd, 'yyyy-MM-dd 23:59:59')
+      })
+
+      const repoName = path.basename(dir)
+
+      for (const commit of log.all) {
+        localCommits.push({
+          message: commit.message,
+          date: new Date(commit.date),
+          repo: repoName,
+          hash: commit.hash
+        })
+      }
+
+      if (verbose) {
+        console.log(`  Found ${log.all.length} local commits in ${repoName}`)
+      }
+    } catch (error: any) {
+      if (verbose) {
+        // Simplify error messages for common issues
+        let errorMsg = error?.message || String(error)
+        if (errorMsg.includes('dubious ownership')) {
+          errorMsg = 'dubious ownership (run: git config --global --add safe.directory ' + dir + ')'
+        } else if (errorMsg.includes('not a git repository')) {
+          errorMsg = 'not a valid git repository or worktree'
+        }
+        console.log(`  Skipping ${path.basename(dir)}: ${errorMsg}`)
+      }
+    }
+  }
+
+  // Step 3: Deduplicate and prioritize local-only commits
+  const githubHashes = new Set(githubCommits.map(c => c.hash))
+  const localOnlyCommits = localCommits.filter(c => !githubHashes.has(c.hash))
+  const commonCommits = localCommits.filter(c => githubHashes.has(c.hash))
+
+  if (verbose) {
+    console.log(`\n📊 Commit breakdown:`)
+    console.log(`  Local-only (unpushed): ${localOnlyCommits.length}`)
+    console.log(`  Pushed to GitHub: ${commonCommits.length}`)
+    console.log(`  Total unique: ${localOnlyCommits.length + commonCommits.length}`)
+  }
+
+  // Step 4: Combine with local-only commits FIRST (prioritized)
+  const allCommits = [...localOnlyCommits, ...commonCommits].map(c => ({
+    message: c.message,
+    date: c.date,
+    repo: c.repo
+  }))
 
   if (verbose) {
     console.log(`Total commits found: ${allCommits.length}`)
@@ -353,16 +540,16 @@ async function getGitHubCommitsForRepo(
   weekStart: Date,
   weekEnd: Date,
   verbose?: boolean
-): Promise<Array<{ message: string; date: Date; repo: string }>> {
-  const commits: Array<{ message: string; date: Date; repo: string }> = []
+): Promise<Array<{ message: string; date: Date; repo: string; hash: string }>> {
+  const commits: Array<{ message: string; date: Date; repo: string; hash: string }> = []
 
   try {
     // Use gh CLI to get commits from GitHub
     const since = format(weekStart, 'yyyy-MM-dd')
     const until = format(weekEnd, 'yyyy-MM-dd')
 
-    // Build the gh API command
-    const command = `gh api repos/${repo}/commits --paginate -q '.[] | select(.commit.author.date >= "${since}" and .commit.author.date <= "${until}") | {message: .commit.message, date: .commit.author.date, author: .commit.author.name}'`
+    // Build the gh API command - now includes sha (hash)
+    const command = `gh api repos/${repo}/commits --paginate -q '.[] | select(.commit.author.date >= "${since}" and .commit.author.date <= "${until}") | {message: .commit.message, date: .commit.author.date, author: .commit.author.name, hash: .sha}'`
 
     if (verbose) {
       console.log(`  Executing: ${command}`)
@@ -378,7 +565,8 @@ async function getGitHubCommitsForRepo(
           commits.push({
             message: data.message,
             date: new Date(data.date),
-            repo: repo.split('/')[1] || repo
+            repo: repo.split('/')[1] || repo,
+            hash: data.hash
           })
         } catch {
           // Skip invalid JSON lines

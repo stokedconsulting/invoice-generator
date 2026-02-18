@@ -72,6 +72,9 @@ export interface InvoiceConfig {
     /** Enable AI-powered invoice generation */
     enabled: boolean
 
+    /** Optional context to guide what work to focus on in invoices */
+    context?: string
+
     /** Stage 1: Analyze code changes and commits */
     codeAnalysis?: {
       /** Enable detailed code change analysis */

@@ -85,6 +85,10 @@ program
   .option('-t, --test', 'Send to test email only (b@stokedconsulting.com)')
   .option('-s, --send', 'Send to customer emails (with confirmation prompt)')
   .option('--send-existing', 'Send a previously generated invoice')
+  .option('-c, --context <text>', 'Optional context to guide invoice focus (e.g., "Focus on patient transfer dashboard features")')
+  .option('-w, --weeks <number>', 'Number of weeks to include (overrides config default)', parseInt)
+  .option('--scope <number>', 'Number of weeks to collect commits from (default: same as weeks)', parseInt)
+  .option('-i, --interactive', 'Interactive mode - choose from AI-generated line item options')
   .option('-v, --verbose', 'Verbose output')
   .option('-l, --list', 'List all available invoice configurations')
   .action(async (configId, options) => {
@@ -249,11 +253,28 @@ program
 
       console.log(chalk.blue(`🚀 Generating invoice: ${config.name}`))
       console.log(chalk.gray(`   Customer: ${config.customer}`))
-      console.log(chalk.gray(`   Schedule: ${config.schedule.type}\n`))
+      console.log(chalk.gray(`   Schedule: ${config.schedule.type}`))
+      if (options.weeks) {
+        console.log(chalk.yellow(`   Weeks: ${options.weeks} (overriding config default)`))
+      }
+      if (options.scope) {
+        console.log(chalk.yellow(`   Commit Scope: ${options.scope} weeks`))
+      }
+      if (options.context) {
+        console.log(chalk.cyan(`   Context: ${options.context}`))
+      }
+      if (options.interactive) {
+        console.log(chalk.magenta(`   Mode: Interactive (you'll choose line items)`))
+      }
+      console.log()
 
       // Generate the invoice
       const invoiceData = await generateInvoiceFromConfig({
         config,
+        runtimeContext: options.context,
+        weeksOverride: options.weeks,
+        scopeOverride: options.scope,
+        interactive: options.interactive,
         verbose: options.verbose
       })
 

@@ -28,30 +28,47 @@ Automated invoice generation system that analyzes **GitHub repository commits** 
 
 ## Installation
 
-1. Install dependencies:
+1. Clone the repository:
+```bash
+git clone https://github.com/brian-stoker/invoice-generator.git
+cd invoice-generator
+```
+
+2. Install dependencies:
 ```bash
 npm install
 ```
 
-2. Set up Gmail credentials:
+3. Set up Gmail credentials:
 ```bash
 cp .env.template .env
 # Edit .env with your Gmail app password
 ```
 
-3. Build the TypeScript files:
+4. Build the TypeScript files:
 ```bash
 npm run build
 ```
 
-4. Install globally (optional):
+5. Set up Invoice Fairy directory:
 ```bash
-./install-global.sh
+./setup-invoice-generator.sh
+```
+
+This creates `~/.invoice-generator/` with:
+- `config.json` - Your invoice configurations
+- `.invoices/` - Saved invoices directory
+
+**All instances (global, dev, scheduler) use this shared config location.**
+
+6. Install globally (optional):
+```bash
+npm install -g .
 ```
 
 ## Configuration
 
-The system uses a `invoice-configs.json` file to manage multiple invoice configurations.
+The system uses `~/.invoice-generator/config.json` to manage multiple invoice configurations. This shared location ensures all instances (global, dev, scheduler) use the same config.
 
 ### Configuration File Format
 
@@ -114,6 +131,7 @@ Enable AI-powered invoice generation for specific, detailed line items instead o
 ```json
 "ai": {
   "enabled": true,
+  "context": "Focus on patient transfer dashboard and fax system (optional)",
   "codeAnalysis": {
     "enabled": true,
     "prompt": "Custom prompt for code analysis (optional)"
@@ -146,6 +164,14 @@ Enable AI-powered invoice generation for specific, detailed line items instead o
 
 **Custom Prompts:**
 You can customize the prompts for each stage to fit your business needs. See the default prompts in `src/ai-analyzer.ts` for examples.
+
+**Context-Driven Invoicing:**
+Guide the AI to focus on specific work areas using optional context:
+- **Config-level**: Add `"context": "Focus on X"` to the `ai` section for permanent focus
+- **Runtime**: Use `--context "Focus on X"` flag for one-time emphasis
+- **Combined**: Both config and runtime contexts are used together for comprehensive guidance
+
+See [CONTEXT_USAGE.md](CONTEXT_USAGE.md) for detailed examples and best practices.
 
 ### Git Configuration
 
@@ -192,9 +218,24 @@ invoice-gen xferall-biweekly
 
 # With verbose output to see GitHub API calls and AI analysis
 invoice-gen xferall-biweekly --verbose
+
+# With context to focus on specific work areas
+invoice-gen xferall-biweekly --context "Focus on patient transfer dashboard features"
+
+# With custom time range (override config default - changes invoice period)
+invoice-gen xferall-biweekly --weeks 4
+
+# With extended commit scope (more commit history for line item options, same invoice period)
+invoice-gen xferall-biweekly --scope 3
+
+# Combine multiple options
+invoice-gen xferall-biweekly --weeks 2 --scope 3 --context "Focus on proxy work" --verbose
+
+# Interactive mode - choose your line items
+invoice-gen xferall-biweekly --interactive
 ```
 
-**Note:** All generated invoices are automatically saved to `.invoices/` directory for later sending.
+**Note:** All generated invoices are automatically saved to `~/.invoice-generator/.invoices/` directory for later sending.
 
 ### Send Invoice (Test Mode)
 
@@ -376,10 +417,13 @@ invoice-generator/
 │   ├── invoice-storage.ts     # Invoice saving/loading
 │   ├── ai-analyzer.ts         # AI-powered analysis
 │   └── email-sender.ts        # Email sending logic
-├── invoice-configs.json       # Invoice configurations
-├── .invoices/                 # Saved invoices (not in git)
+├── setup-invoice-generator.sh  # Setup script for ~/.invoice-generator/
 ├── .env                       # Gmail credentials (not in git)
 └── package.json
+
+~/.invoice-generator/          # User config directory (not in repo)
+├── config.json                # Your invoice configurations
+└── .invoices/                 # Saved invoices
 ```
 
 ### Building
