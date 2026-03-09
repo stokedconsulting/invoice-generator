@@ -118,6 +118,25 @@ export function listInvoices(configId?: string): SavedInvoice[] {
 }
 
 /**
+ * Update an existing saved invoice with new invoice data
+ */
+export function updateInvoice(invoiceId: string, invoiceData: InvoiceData): SavedInvoice {
+  const filePath = getInvoicePath(invoiceId)
+
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Invoice not found: ${invoiceId}`)
+  }
+
+  const savedInvoice: SavedInvoice = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+  savedInvoice.invoiceData = invoiceData
+  savedInvoice.generatedAt = new Date().toISOString()
+
+  fs.writeFileSync(filePath, JSON.stringify(savedInvoice, null, 2))
+
+  return savedInvoice
+}
+
+/**
  * Delete a saved invoice
  */
 export function deleteInvoice(invoiceId: string): void {

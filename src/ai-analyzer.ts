@@ -99,7 +99,7 @@ The code analysis and target hours will be provided below. Generate 15-20 divers
 /**
  * Run Claude Code CLI with a prompt
  */
-async function runClaudeCLI(prompt: string, verbose?: boolean): Promise<string> {
+export async function runClaudeCLI(prompt: string, verbose?: boolean): Promise<string> {
   try {
     if (verbose) {
       console.log('Running Claude Code analysis...')

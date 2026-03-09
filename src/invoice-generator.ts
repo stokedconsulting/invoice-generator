@@ -6,8 +6,10 @@ import { exec } from 'child_process'
 import { promisify } from 'util'
 import { InvoiceConfig } from './types/config'
 import { glob } from 'glob'
-import { runAIAnalysis } from './ai-analyzer'
+import { runAIAnalysis, runClaudeCLI } from './ai-analyzer'
 import { selectLineItems, showSelectionSummary, LineItemCandidate } from './interactive-selector'
+import { openBucketEditor, assignTasksToWeeks, BucketTask, AssignedBucketTask } from './bucket-editor'
+import chalk from 'chalk'
 
 const execAsync = promisify(exec)
 
@@ -29,10 +31,11 @@ interface InvoiceOptionsFromConfig {
   weeksOverride?: number
   scopeOverride?: number
   interactive?: boolean
+  buckets?: boolean
   verbose?: boolean
 }
 
-interface WeeklyWork {
+export interface WeeklyWork {
   weekStart: Date
   weekEnd: Date
   dateRange: string
@@ -40,7 +43,7 @@ interface WeeklyWork {
   tasks: TaskSummary[]
 }
 
-interface TaskSummary {
+export interface TaskSummary {
   description: string
   hours: number
   commits: number
@@ -55,7 +58,7 @@ export interface InvoiceData {
   weeks: WeeklyWork[]
 }
 
-export async function generateInvoice(options: InvoiceOptions, config?: InvoiceConfig, runtimeContext?: string, interactive?: boolean): Promise<InvoiceData | null> {
+export async function generateInvoice(options: InvoiceOptions, config?: InvoiceConfig, runtimeContext?: string, interactive?: boolean, buckets?: boolean): Promise<InvoiceData | null> {
   const { customer, weeks = 2, scope, verbose, repoPaths, githubRepos, hoursPerWeek = 30 } = options
 
   // scope determines commit collection window, weeks determines invoice period
@@ -116,6 +119,82 @@ export async function generateInvoice(options: InvoiceOptions, config?: InvoiceC
   }
 
   const totalHours = weeklyWork.reduce((sum, week) => sum + week.totalHours, 0)
+
+  // Bucket workflow: user-defined task structure via $EDITOR
+  if (buckets) {
+    const invoicePeriod = `${format(startDate, 'MMM d')} - ${format(endDate, 'MMM d, yyyy')}`
+    const editorResult = openBucketEditor(invoicePeriod, hoursPerWeek, weeklyWork.length)
+
+    if (!editorResult.wasEdited || editorResult.tasks.length === 0) {
+      console.log(chalk.yellow('\n⚠️  No bucket tasks defined — falling through to standard AI generation'))
+    } else {
+      // Build per-week commit map
+      const weeklyCommitMap = weeklyWork.map(week =>
+        allCommits.filter(c => c.date >= week.weekStart && c.date <= week.weekEnd)
+      )
+
+      // Assign tasks to weeks
+      const assignments = assignTasksToWeeks(editorResult.tasks, weeklyCommitMap, weeklyWork.length)
+
+      // Populate weeklyWork with bucket tasks, distributing hours evenly within each week
+      for (let w = 0; w < weeklyWork.length; w++) {
+        const weekAssignments = assignments.filter(a => a.weekIndex === w)
+
+        if (weekAssignments.length > 0) {
+          const hoursEach = Math.round((weeklyWork[w].totalHours / weekAssignments.length) * 2) / 2
+          let remaining = weeklyWork[w].totalHours
+
+          weeklyWork[w].tasks = weekAssignments.map((a, i) => {
+            const isLast = i === weekAssignments.length - 1
+            const hours = isLast ? remaining : Math.min(hoursEach, remaining)
+            remaining -= hours
+            return {
+              description: a.description,
+              hours,
+              commits: 0
+            }
+          })
+        }
+      }
+
+      // Optionally polish descriptions via AI
+      if (config?.ai?.enabled) {
+        await polishBucketTasks(weeklyWork, allCommits, verbose)
+      }
+
+      // Interactive mode: let user refine per week
+      if (interactive) {
+        for (const week of weeklyWork) {
+          if (week.tasks.length > 0) {
+            const candidates: LineItemCandidate[] = week.tasks.map(t => ({
+              description: t.description,
+              hours: t.hours,
+              selected: false
+            }))
+
+            const selected = await selectLineItems(candidates, week.totalHours, week.dateRange)
+            week.tasks = selected.map(item => ({
+              description: item.description,
+              hours: item.hours,
+              commits: 0
+            }))
+          }
+        }
+      }
+
+      // Early return with formatted invoice (skip normal AI block)
+      const invoiceText = formatInvoice(weeklyWork)
+
+      return {
+        customer,
+        startDate: format(startDate, 'MMMM d, yyyy'),
+        endDate: format(endDate, 'MMMM d, yyyy'),
+        text: invoiceText,
+        totalHours,
+        weeks: weeklyWork
+      }
+    }
+  }
 
   // Run AI analysis if enabled
   if (config?.ai?.enabled && allCommits.length > 0) {
@@ -188,7 +267,7 @@ export async function generateInvoice(options: InvoiceOptions, config?: InvoiceC
 }
 
 export async function generateInvoiceFromConfig(options: InvoiceOptionsFromConfig): Promise<InvoiceData | null> {
-  const { config, runtimeContext, weeksOverride, scopeOverride, interactive, verbose } = options
+  const { config, runtimeContext, weeksOverride, scopeOverride, interactive, buckets, verbose } = options
 
   // Use repoDirs (local directories) if provided, otherwise empty
   const repoPaths = config.git.repoDirs || []
@@ -207,7 +286,7 @@ export async function generateInvoiceFromConfig(options: InvoiceOptionsFromConfi
     hoursPerWeek: config.git.hoursPerWeek,
     verbose,
     githubRepos: config.git.repos
-  }, config, runtimeContext, interactive)
+  }, config, runtimeContext, interactive, buckets)
 }
 
 async function resolveRepoPaths(patterns: string[], verbose?: boolean): Promise<string[]> {
@@ -744,7 +823,77 @@ function parseAILineItems(lineItemsText: string): TaskSummary[] {
   return tasks
 }
 
-function formatInvoice(weeks: WeeklyWork[]): string {
+/**
+ * Polish bucket task descriptions via AI using commit context
+ */
+async function polishBucketTasks(
+  weeklyWork: WeeklyWork[],
+  allCommits: Array<{ message: string; date: Date; repo: string }>,
+  verbose?: boolean
+): Promise<void> {
+  const taskDescriptions = weeklyWork
+    .flatMap((week, i) => week.tasks.map(t => `Week ${i + 1}: ${t.description}`))
+    .join('\n')
+
+  if (!taskDescriptions.trim()) return
+
+  const commitSummary = allCommits
+    .slice(0, 50) // limit to most recent 50 commits for context
+    .map(c => `[${c.repo}] ${c.message}`)
+    .join('\n')
+
+  const prompt = `You are refining invoice line item descriptions. Given user-defined task descriptions and recent git commits for context, rewrite each task description to be more professional and specific.
+
+RULES:
+- Keep the same number of tasks and same structure
+- Do NOT change hours or add/remove tasks
+- Make descriptions client-friendly and professional
+- Use commit context to add specificity where possible
+- Preserve the user's intent and grouping
+- Output ONLY the refined descriptions, one per line, in the same order
+
+=== USER TASK DESCRIPTIONS ===
+${taskDescriptions}
+
+=== RECENT COMMITS (for context) ===
+${commitSummary}
+
+=== REFINED DESCRIPTIONS (one per line, same order) ===`
+
+  try {
+    if (verbose) {
+      console.log(chalk.gray('\n🤖 Polishing bucket task descriptions with AI...'))
+    }
+
+    const result = await runClaudeCLI(prompt, verbose)
+    const polishedLines = result.split('\n').filter(l => l.trim())
+
+    // Map polished descriptions back to tasks
+    let lineIndex = 0
+    for (const week of weeklyWork) {
+      for (const task of week.tasks) {
+        if (lineIndex < polishedLines.length) {
+          // Strip any leading "Week N:" prefix the AI might echo back
+          const polished = polishedLines[lineIndex].replace(/^(Week\s+\d+:\s*)/i, '').trim()
+          if (polished) {
+            task.description = polished
+          }
+        }
+        lineIndex++
+      }
+    }
+
+    if (verbose) {
+      console.log(chalk.gray('✅ Descriptions polished'))
+    }
+  } catch (error) {
+    if (verbose) {
+      console.log(chalk.yellow('⚠️  AI polish failed, keeping original descriptions'))
+    }
+  }
+}
+
+export function formatInvoice(weeks: WeeklyWork[]): string {
   const lines: string[] = []
 
   for (const week of weeks) {
@@ -763,4 +912,66 @@ function formatInvoice(weeks: WeeklyWork[]): string {
   }
 
   return lines.join('\n').trim()
+}
+
+/**
+ * Apply edited weeks back onto an InvoiceData object.
+ * Recalculates totalHours and re-renders the text.
+ */
+export function applyEditedWeeks(
+  invoice: InvoiceData,
+  editedWeeks: import('./bucket-editor').EditedWeek[]
+): InvoiceData {
+  // Build a map from dateRange to edited week for matching
+  const editedMap = new Map(editedWeeks.map(w => [w.dateRange, w]))
+
+  const updatedWeeks: WeeklyWork[] = []
+
+  // Update existing weeks that match by dateRange
+  for (const week of invoice.weeks) {
+    const edited = editedMap.get(week.dateRange)
+    if (edited) {
+      updatedWeeks.push({
+        ...week,
+        totalHours: edited.totalHours,
+        tasks: edited.tasks.map(t => ({
+          description: t.description,
+          hours: t.hours,
+          commits: 0
+        }))
+      })
+      editedMap.delete(week.dateRange)
+    }
+    // If the week was deleted from the editor, warn but preserve it
+    // (plan says: "Week header deleted → Warn and skip — don't lose weeks silently")
+    else {
+      console.warn(`⚠️  Week "${week.dateRange}" was removed from editor — preserving original`)
+      updatedWeeks.push(week)
+    }
+  }
+
+  // Add any new weeks that weren't in the original
+  for (const [, edited] of editedMap) {
+    updatedWeeks.push({
+      weekStart: new Date(),
+      weekEnd: new Date(),
+      dateRange: edited.dateRange,
+      totalHours: edited.totalHours,
+      tasks: edited.tasks.map(t => ({
+        description: t.description,
+        hours: t.hours,
+        commits: 0
+      }))
+    })
+  }
+
+  const totalHours = updatedWeeks.reduce((sum, w) => sum + w.totalHours, 0)
+  const text = formatInvoice(updatedWeeks)
+
+  return {
+    ...invoice,
+    totalHours,
+    text,
+    weeks: updatedWeeks
+  }
 }

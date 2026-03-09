@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander'
-import { generateInvoice, generateInvoiceFromConfig } from './invoice-generator'
+import { generateInvoice, generateInvoiceFromConfig, applyEditedWeeks } from './invoice-generator'
 import { sendInvoiceEmail, sendInvoiceEmailFromConfig } from './email-sender'
 import { loadConfigs, getConfigById } from './config-loader'
-import { saveInvoice, listInvoices, loadInvoice, markInvoiceAsSent } from './invoice-storage'
+import { saveInvoice, listInvoices, loadInvoice, markInvoiceAsSent, updateInvoice } from './invoice-storage'
+import { openInvoiceEditor } from './bucket-editor'
+import { postInvoiceToApi } from './api-client'
 import chalk from 'chalk'
 import { format } from 'date-fns'
 import inquirer from 'inquirer'
@@ -85,10 +87,12 @@ program
   .option('-t, --test', 'Send to test email only (b@stokedconsulting.com)')
   .option('-s, --send', 'Send to customer emails (with confirmation prompt)')
   .option('--send-existing', 'Send a previously generated invoice')
+  .option('--edit', 'Edit a previously generated invoice in $EDITOR')
   .option('-c, --context <text>', 'Optional context to guide invoice focus (e.g., "Focus on patient transfer dashboard features")')
   .option('-w, --weeks <number>', 'Number of weeks to include (overrides config default)', parseInt)
   .option('--scope <number>', 'Number of weeks to collect commits from (default: same as weeks)', parseInt)
   .option('-i, --interactive', 'Interactive mode - choose from AI-generated line item options')
+  .option('-b, --buckets', 'Define task buckets in $EDITOR before generation')
   .option('-v, --verbose', 'Verbose output')
   .option('-l, --list', 'List all available invoice configurations')
   .action(async (configId, options) => {
@@ -220,10 +224,109 @@ program
             markInvoiceAsSent(selectedInvoiceId)
           }
           console.log(chalk.green(testMode ? '\n✅ Test invoice sent to b@stokedconsulting.com' : '\n✅ Invoice sent successfully!'))
+          postInvoiceToApi(savedInvoice.invoiceData, configId).catch(() => {})
         } else {
           console.error(chalk.red(`❌ Failed to send email: ${emailResult.error}`))
           process.exit(1)
         }
+
+        return
+      }
+
+      // Edit existing invoice mode
+      if (options.edit) {
+        if (!configId) {
+          console.error(chalk.red('❌ Config ID required for --edit'))
+          console.log(chalk.yellow('\nUsage: invoice-gen <config-id> --edit'))
+          process.exit(1)
+        }
+
+        const config = getConfigById(configId)
+        if (!config) {
+          console.error(chalk.red(`❌ Configuration '${configId}' not found`))
+          process.exit(1)
+        }
+
+        // List saved invoices for this config
+        const savedInvoices = listInvoices(configId)
+
+        if (savedInvoices.length === 0) {
+          console.log(chalk.yellow(`\n📭 No saved invoices found for '${configId}'`))
+          console.log(chalk.gray('Generate an invoice first before editing'))
+          process.exit(0)
+        }
+
+        console.log(chalk.blue(`\n📋 Saved Invoices for ${config.name}:\n`))
+
+        // Create choices for inquirer
+        const choices = savedInvoices.map(inv => {
+          const sentLabel = inv.sentAt ? chalk.green(' [SENT]') : ''
+          const generatedDate = format(new Date(inv.generatedAt), 'MMM dd, yyyy HH:mm')
+          return {
+            name: `${inv.invoiceData.startDate} - ${inv.invoiceData.endDate} (${generatedDate})${sentLabel}`,
+            value: inv.id,
+            short: `${inv.invoiceData.startDate} - ${inv.invoiceData.endDate}`
+          }
+        })
+
+        choices.push({
+          name: chalk.gray('Cancel'),
+          value: 'cancel',
+          short: 'Cancel'
+        })
+
+        const { selectedInvoiceId } = await inquirer.prompt([
+          {
+            type: 'list',
+            name: 'selectedInvoiceId',
+            message: 'Select an invoice to edit:',
+            choices
+          }
+        ])
+
+        if (selectedInvoiceId === 'cancel') {
+          console.log(chalk.gray('\nCancelled'))
+          process.exit(0)
+        }
+
+        const savedInvoice = loadInvoice(selectedInvoiceId)
+
+        // Show current invoice
+        console.log(chalk.blue('\n📄 Current invoice:\n'))
+        console.log(chalk.gray('─'.repeat(60)))
+        console.log(savedInvoice.invoiceData.text)
+        console.log(chalk.gray('─'.repeat(60)))
+
+        // Open in editor
+        console.log(chalk.blue('\nOpening invoice in $EDITOR...'))
+        const originalText = savedInvoice.invoiceData.text
+        const editorResult = openInvoiceEditor(originalText)
+
+        if (!editorResult.wasEdited || editorResult.weeks.length === 0) {
+          console.log(chalk.gray('\nEdit cancelled'))
+          process.exit(0)
+        }
+
+        // Check if anything actually changed by re-rendering and comparing
+        const updatedInvoice = applyEditedWeeks(savedInvoice.invoiceData, editorResult.weeks)
+
+        if (updatedInvoice.text === originalText) {
+          console.log(chalk.gray('\nNo changes detected'))
+          process.exit(0)
+        }
+
+        // Show old vs new totals if they differ
+        if (updatedInvoice.totalHours !== savedInvoice.invoiceData.totalHours) {
+          console.log(chalk.yellow(`\nTotal hours changed: ${savedInvoice.invoiceData.totalHours}hrs → ${updatedInvoice.totalHours}hrs`))
+        }
+
+        // Save the updated invoice
+        updateInvoice(selectedInvoiceId, updatedInvoice)
+
+        console.log(chalk.green('\n✅ Invoice updated!\n'))
+        console.log(chalk.gray('─'.repeat(60)))
+        console.log(updatedInvoice.text)
+        console.log(chalk.gray('─'.repeat(60)))
 
         return
       }
@@ -263,6 +366,9 @@ program
       if (options.context) {
         console.log(chalk.cyan(`   Context: ${options.context}`))
       }
+      if (options.buckets) {
+        console.log(chalk.magenta(`   Mode: Bucket editor ($EDITOR will open for task definition)`))
+      }
       if (options.interactive) {
         console.log(chalk.magenta(`   Mode: Interactive (you'll choose line items)`))
       }
@@ -275,6 +381,7 @@ program
         weeksOverride: options.weeks,
         scopeOverride: options.scope,
         interactive: options.interactive,
+        buckets: options.buckets,
         verbose: options.verbose
       })
 
@@ -314,6 +421,7 @@ program
 
         if (emailResult.success) {
           console.log(chalk.green(`✅ Test invoice sent to b@stokedconsulting.com`))
+          postInvoiceToApi(invoiceData, configId).catch(() => {})
         } else {
           console.error(chalk.red(`❌ Failed to send email: ${emailResult.error}`))
           process.exit(1)
@@ -366,6 +474,7 @@ program
         if (emailResult.success) {
           markInvoiceAsSent(savedInvoice.id)
           console.log(chalk.green(`\n✅ Invoice sent successfully!`))
+          postInvoiceToApi(invoiceData, configId).catch(() => {})
         } else {
           console.error(chalk.red(`❌ Failed to send email: ${emailResult.error}`))
           process.exit(1)
