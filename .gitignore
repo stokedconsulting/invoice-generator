@@ -1,6 +1,19 @@
 node_modules/
 dist/
 .env
+.env.*
 *.log
 .DS_Store
 .invoices/
+
+# Claude / Stokd session data
+.claude-sessions/
+.stokd/
+cost-log*
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
